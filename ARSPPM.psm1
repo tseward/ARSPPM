@@ -2,7 +2,7 @@
 $patchUnc = '' #folder containing patch
 $patches = @() #array of patches (exe detection)
 $fullPaths = ''
-$confWizard = 'psconfig.exe -cmd upgrade -inplace b2b -wait -cmd applicationcontent -install -cmd installfeatures -cmd secureresources'
+$confWizard = '-cmd upgrade -inplace b2b -wait -cmd applicationcontent -install -cmd installfeatures -cmd secureresources'
 
 function Get-RmFarmVersion
 {
@@ -61,10 +61,14 @@ function Stop-RmSPServices
     )
 
     $scriptBlock = {
+        Write-Host 'Stopping IIS'
         Start-Process 'iisreset.exe' -ArgumentList '/stop' -Wait -PassThru -NoNewWindow
+        Write-Host 'Disabling IISAdmin and SPTimerV4.'
         Set-Service -Name IISAdmin -StartupType Disabled
         Set-Service -Name SPTimerV4 -StartupType Disabled
+        Write-Host 'Stopping IISAdmin'
         Stop-Service IISAdmin
+        Write-Host 'Stopping SPTimerV4'
         Stop-Service SPTimerV4
     }
 
@@ -83,9 +87,12 @@ function Start-RmSPServices
     )
 
     $scriptBlock = {
+        Write-Host 'Setting IISAdmin and SPTimerV4 to Automatic.'
         Set-Service -Name IISAdmin -StartupType Automatic
         Set-Service -Name SPTimerV4 -StartupType Automatic
+        Write-Host 'Starting IISAdmin'
         Start-Service IISAdmin
+        Write-Host 'Starting SPTimerV4'
         Start-Service SPTimerV4
         Start-Process 'iisreset.exe' -ArgumentList '/start' -Wait -PassThru -NoNewWindow
     }
@@ -111,37 +118,50 @@ function Invoke-RmStopPauseSearch
     )
 
     $scriptBlock = {
+        param
+        (
+            [string]
+            [Parameter(Mandatory=$true)]
+            $ServerName,
+            [int]
+            [Parameter(Mandatory=$true)]
+            $Version,
+            [bool]
+            [Parameter(Mandatory=$true)]
+            $Pause
+        )
+
         Add-PSSnapin Microsoft.SharePoint.PowerShell
 
         foreach($ssa in Get-SPEnterpriseSearchServiceApplication)
         {
-            if($using:Pause)
+            if($Pause)
             {
-                [int]$i = 0
-
+                Write-Host "Pausing $($ssa.Name)"
                 $ssa.Pause()
 
-                while($ssa.IsPaused() -ne 128)
+                if($ssa.IsPaused() -eq 128)
                 {
-                    Sleep 10
-                    ++$i
-
-                    if(i -gt 24)
-                    {
-                        #timeout
-                        break
-                    }
+                    Write-Host 'Search paused successfully.'
                 }
+                else
+                {
+                    Write-Host 'Trying once more...'
+                    $ssa.Pause()
+                }
+
             }
         }
 
-        if($using:Version -eq 15 -or $using:Version -eq 16)
+        if($Version -eq 15 -or $Version -eq 16)
         {
+            Write-Host 'Disabling SPSearchHostController'
             Set-Service -Name SPSearchHostController -StartupType Disabled
             Stop-Service SPSearchHostController
         }
 
-        switch ($using:Version)
+        Write-Host "Stopping OSearch$Version"
+        switch ($Version)
         {
             14 {Set-Service -Name OSearch14 -StartupType Disabled; Stop-Service OSearch14 }
             15 {Set-Service -Name OSearch15 -StartupType Disabled; Stop-Service OSearch15 }
@@ -149,7 +169,7 @@ function Invoke-RmStopPauseSearch
         }
     }
     $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
-    Invoke-Command -ScriptBlock $scriptBlock -Session $session
+    Invoke-Command -ScriptBlock $scriptBlock -Session $session -ArgumentList $ServerName,$Version,$Pause
     Remove-PSSession -Session $session
 }
 
@@ -169,29 +189,22 @@ function Invoke-RmStartResumeSearch
     )
 
     $scriptBlock = {
+        param
+        (
+            [string]
+            [Parameter(Mandatory=$true)]
+            $ServerName,
+            [int]
+            [Parameter(Mandatory=$true)]
+            $Version,
+            [bool]
+            [Parameter(Mandatory=$true)]
+            $Pause
+        )
+
         Add-PSSnapin Microsoft.SharePoint.PowerShell -EA 0
 
-        foreach($ssa in Get-SPEnterpriseSearchServiceApplication)
-        {
-            if($Pause)
-            {
-                $ssa.Resume()
-                [int]$i = 0
-
-                while($ssa.IsPaused() -eq 0)
-                {
-                    Sleep 10
-                    ++$i
-
-                    if(i -gt 24)
-                    {
-                        #timeout
-                        break
-                    }
-                }
-            }
-        }
-
+        Write-Host "Starting OSearch$Version"
         switch ($Version)
         {
             14 {Set-Service -Name OSearch14 -StartupType Manual; Start-Service OSearch14 }
@@ -201,12 +214,34 @@ function Invoke-RmStartResumeSearch
 
         if($Version -eq 15 -or $Version -eq 16)
         {
+            Write-Host 'Enabling SPSearchHostController'
             Set-Service -Name SPSearchHostController -StartupType Automatic
             Start-Service SPSearchHostController
         }
+
+        foreach($ssa in Get-SPEnterpriseSearchServiceApplication)
+        {
+            if($Pause)
+            {
+                Write-Host "Resuming $($ssa.Name)"
+                $ssa.Resume()
+
+                if($ssa.IsPaused() -eq 0)
+                {
+                    Write-Host 'Resumed Search succesfully'
+                }
+                else
+                {
+                    Write-Host 'Trying one more time...'
+                    $ssa.Resume()
+                }
+            }
+        }
     }
 
-    Invoke-Command -ComputerName $ServerName -ScriptBlock $scriptBlock
+    $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
+    Invoke-Command -ScriptBlock $scriptBlock -Session $session -ArgumentList $ServerName,$Version,$Pause
+    Remove-PSSession -Session $session
 }
 
 function Invoke-RmPatch
@@ -223,14 +258,15 @@ function Invoke-RmPatch
         [Parameter(Mandatory=$true)]
         $Patch
     )
-
+    $restart = $false
     $scriptBlock = {
         param([string]
             [Parameter(Mandatory=$true)]
             $Patch
             )
+        Write-Host "Installing $patch"
         $p = Start-Process $Patch -ArgumentList '/quiet /norestart' -Wait -PassThru -NoNewWindow
-
+        Write-Host "Completed installing $patch with an ExitCode of $($p.ExitCode)"
         if(!($p.ExitCode -eq 0) -and !($p.ExitCode -eq 3010) -and !($p.ExitCode -eq 17022)){
             throw [System.Configuration.Install.InstallException] "The patch failed to install. ExitCode: $($p.ExitCode)" 
         }
@@ -238,6 +274,7 @@ function Invoke-RmPatch
         if(($p.ExitCode -eq 3010) -or ($p.ExitCode -eq 17022))
         {
             $restart = $true
+            Write-Host "A restart of $ServerName is required."
         }
     }
 
@@ -271,11 +308,20 @@ function Invoke-RmConfigWizard
         $ServerName
     )
 
-    #$session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
-    $scriptBlock = { $p = Start-Process $confWizard -Wait -PassThru -NoNewWindow }
-    #what are $p return codes?
+    $scriptBlock = { 
+    param
+    (
+        [string]
+        [Parameter(Mandatory=$true)]
+        $confWizard
+    )
+
+    Add-PSSnapin Microsoft.SharePoint.PowerShell
+    $p = Start-Process 'psconfig.exe' -ArgumentList $confWizard -Wait -PassThru -NoNewWindow
+    Write-Host "ExitCode: $($p.ExitCode)" }
+
     $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
-    Invoke-Command -Session $session -ScriptBlock $scriptBlock
+    Invoke-Command -Session $session -ScriptBlock $scriptBlock -ArgumentList $confWizard
     Remove-PSSession $session
 }
 
@@ -290,11 +336,15 @@ function Invoke-RmSPContentDatabaseUpgrade
 
     $scriptBlock = {
         Add-PSSnapin Microsoft.SharePoint.PowerShell
-        
+        Write-Host 'Beginning Content Database Upgrade.'
         foreach($db in Get-SPContentDatabase)
         {
-            Upgrade-SPContentDatabase $db
+            Write-Host "Upgrading $($db.Name)..."
+            Upgrade-SPContentDatabase $db -Confirm:$false
+            Write-Host "Completed upgrading $($db.Name)."
         }
+
+        Write-Host 'All Content Databases have been upgraded.'
     }
 
     $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
@@ -325,11 +375,11 @@ function Update-RmStopDistributedCache
             Use-CacheCluster
             #Get-AFCacheClusterHealth
             $computer = [System.Net.Dns]::GetHostByName(($env:computerName)).HostName
-            Write-Host "Shutting down distributed cache host."
+            Write-Host "Shutting down Distributed Cache host $computer."
 
             try
             {
-                        $hostInfo = Stop-CacheHost -Graceful -CachePort 22233 -HostName $computer
+                $hostInfo = Stop-CacheHost -Graceful -CachePort 22233 -HostName $computer
             }
             catch [Microsoft.ApplicationServer.Caching.DataCacheException]
             {
@@ -350,9 +400,8 @@ function Update-RmStopDistributedCache
                 $hostInfo = Get-CacheHost -HostName $computer -CachePort 22233
             }
 
-            Write-Host "Stopping distributed cache host was successful. Updating Service status in SharePoint."
+            Write-Host 'Stopping distributed cache host was successful. Updating Service status in SharePoint.'
             Stop-SPDistributedCacheServiceInstance
-            Write-Host "To start service, please use Central Administration site."
         }
         catch [System.Exception]
         {
@@ -374,12 +423,19 @@ function Update-RmStartDistributedCache
         $ServerName
     )
 
-    #pulled from TN
-
     $scriptBlock = {
+        param
+        (
+            [string]
+            [Parameter(Mandatory=$true)]
+            $ServerName
+        )
+
         Add-PSSnapin Microsoft.SharePoint.PowerShell -EA 0
-            $si = Get-SPServiceInstance | ?{$_.TypeName -match 'Distributed'}
+            $si = Get-SPServiceInstance -Server $ServerName | ?{$_.TypeName -match 'Distributed Cache'}
+            Write-Host "Starting Distributed Cache on $ServerName."
             $si.Provision()
+            Write-Host 'Completed.'
         }
 
     $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
@@ -415,7 +471,7 @@ function Start-RmSPUpdate
         $Search,
         [PSCredential]
         [Parameter(Mandatory=$true)]
-        $Credential
+        $Cred
     )
 
     $Version = Get-RmFarmVersion
@@ -443,9 +499,11 @@ function Start-RmSPUpdate
         }
 
         Stop-RmSPServices $server
-        Invoke-RmPatch $server $isDcs
+        Invoke-RmStopPauseSearch $server $version $PauseSearch
+        Invoke-RmPatch $server $isDcs $PatchToApply
         Start-RmSPServices $server
-        
+        Invoke-RmStartResumeSearch $server $version $PauseSearch
+
         $isDcs = $false         
     }
 
@@ -455,4 +513,12 @@ function Start-RmSPUpdate
     {
         Invoke-RmConfigWizard $server
     }
+}
+
+function Invoke-SharePointWinRmConfig
+{
+    Enable-PSRemoting -Force
+    Enable-WSManCredSSP –Role Server -Force
+    winrm set winrm/config/winrs '@{MaxShellsPerUser="25"}'
+    winrm set winrm/config/winrs '@{MaxMemoryPerShellMB="1024"}'
 }
