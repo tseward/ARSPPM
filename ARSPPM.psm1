@@ -1,8 +1,43 @@
-﻿$initialHost = '' #Get farm server information
-$patchUnc = '' #folder containing patch
-$patches = @() #array of patches (exe detection)
-$fullPaths = ''
-$confWizard = '-cmd upgrade -inplace b2b -wait -cmd applicationcontent -install -cmd installfeatures -cmd secureresources'
+﻿function Get-OfficeErrorCode
+{
+    param
+    (
+    [int]
+    [Parameter(Mandatory=$true)]
+    $ErrorCode
+    )
+    # Office Error Codes
+    # https://technet.microsoft.com/en-us/library/cc179058%28v=office.14%29.aspx
+    switch($ErrorCode)
+    {
+        17301 { Write-Host 'Error: General Detection error' }
+        17302 { Write-Host 'Error: Applying patch' }
+        17303 { Write-Host 'Error: Extracting file' }
+        17021 { Write-Host 'Error: Creating temp folder' }
+        17022 { Write-Host 'Success: Reboot flag set' }
+        17023 { Write-Host 'Error: User cancelled installation' }
+        17024 { Write-Host 'Error: Creating folder failed' }
+        17025 { Write-Host 'Patch already installed' }
+        17026 { Write-Host 'Patch already installed to admin installation' }
+        17027 { Write-Host 'Installation source requires full file update' }
+        17028 { Write-Host 'No product installed for contained patch' }
+        17029 { Write-Host 'Patch failed to install' }
+        17030 { Write-Host 'Detection: Invalid CIF format' }
+        17031 { Write-Host 'Detection: Invalid baseline' }
+        17034 { Write-Host 'Error: Required patch does not apply to the machine' }
+        17038 { Write-Host 'You do not have sufficient privileges to complete this installation for all users of the machine. Log on as administrator and then retry this installation.' }
+        17044 { Write-Host 'Installer was unable to run detection for this package.' }
+        default { Write-Host 'Unknown error' }
+    }
+}
+
+function Invoke-SharePointWinRmConfig
+{
+    Enable-PSRemoting -Force
+    Enable-WSManCredSSP –Role Server -Force
+    winrm set winrm/config/winrs '@{MaxShellsPerUser="25"}'
+    winrm set winrm/config/winrs '@{MaxMemoryPerShellMB="1024"}'
+}
 
 function Get-RmFarmVersion
 {
@@ -15,7 +50,7 @@ function Get-RmFarmVersion
 
     $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
     $Version = Invoke-Command -Session $session -ScriptBlock { 
-            Add-PSSnapin Microsoft.SharePoint.PowerShell; 
+            Add-PSSnapin Microsoft.SharePoint.PowerShell
             (Get-SPFarm).BuildVersion.Major
         }
     Remove-PSSession $session
@@ -24,7 +59,6 @@ function Get-RmFarmVersion
 
 function Get-RmFarmServers
 {
-
     param
     (
         [string]
@@ -42,6 +76,72 @@ function Get-RmFarmServers
     Remove-PSSession $session
     return $serverList
 }
+
+function Get-RmDistributedCacheHosts
+{
+    param
+    (
+        [string]
+        [Parameter(Mandatory=$true)]
+        $ServerName
+    )
+
+
+    $scriptBlock = { 
+            Add-PSSnapin Microsoft.SharePoint.PowerShell
+            $dcs = Get-SPServiceInstance | ?{$_.TypeName -eq 'Distributed Cache'}
+            $dcHosts = @()
+            if($dcs.Count -gt 0)
+            {
+                foreach($dc in $dcs)
+                {
+                    $dcHosts += $dc.Server.Address
+                }
+            }
+
+            return $dcHosts
+        }
+
+    $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
+    $dcHosts = Invoke-Command -Session $session -ScriptBlock $scriptBlock
+    Remove-PSSession $session
+
+    return $dcHosts 
+}
+
+function Get-RmSearchServerHosts
+{
+    param
+    (
+        [string]
+        [Parameter(Mandatory=$true)]
+        $ServerName
+    )
+
+
+    $scriptBlock = { 
+            Add-PSSnapin Microsoft.SharePoint.PowerShell
+            $srs = Get-SPEnterpriseSearchServiceInstance| ?{$_.Status -eq 'Online'}
+            $srsHosts = @()
+            if($srs.Count -gt 0)
+            {
+                foreach($sr in $srs)
+                {
+                    $srsHosts += $sr.Server.Address
+                }
+            }
+
+            return $srsHosts
+        }
+
+    $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
+    $srsHosts = Invoke-Command -Session $session -ScriptBlock $scriptBlock
+    Remove-PSSession $session
+
+    return $srsHosts 
+}
+
+#Get-Patches not used
 function Get-Patches
 {
     $patches = gci -Path "$($patchesUnc)\" -Include *.exe
@@ -57,7 +157,10 @@ function Stop-RmSPServices
     (
         [string]
         [Parameter(Mandatory=$true)]
-        $ServerName
+        $ServerName,
+        [PSCredential]
+        [Parameter(Mandatory=$false)]
+        $cred
     )
 
     $scriptBlock = {
@@ -72,9 +175,9 @@ function Stop-RmSPServices
         Stop-Service SPTimerV4
     }
 
-    $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
-    Invoke-Command -Session $session -ScriptBlock $scriptBlock
-    Remove-PSSession $session
+    Write-Host "Stopping services on $ServerName..."
+
+    Invoke-Command -ComputerName $ServerName -ScriptBlock $scriptBlock -Authentication Credssp -Credential $cred
 }
 
 function Start-RmSPServices
@@ -83,7 +186,13 @@ function Start-RmSPServices
     (
         [string]
         [Parameter(Mandatory=$true)]
-        $ServerName
+        $ServerName,
+        [bool]
+        [Parameter(Mandatory=$true)]
+        $AsJob,
+        [PSCredential]
+        [Parameter(Mandatory=$false)]
+        $cred
     )
 
     $scriptBlock = {
@@ -97,8 +206,18 @@ function Start-RmSPServices
         Start-Process 'iisreset.exe' -ArgumentList '/start' -Wait -PassThru -NoNewWindow
     }
 
+    Write-Host "Starting services on $ServerName..."
     $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
-    Invoke-Command -Session $session -ScriptBlock $scriptBlock
+
+    if($AsJob = $true)
+    {
+        Invoke-Command -Session $session -ScriptBlock $scriptBlock -AsJob
+    }
+    else
+    {
+        Invoke-Command -Session $session -ScriptBlock $scriptBlock
+    }
+
     Remove-PSSession $session
 }
 
@@ -114,7 +233,10 @@ function Invoke-RmStopPauseSearch
         $Version,
         [bool]
         [Parameter(Mandatory=$true)]
-        $Pause
+        $Pause,
+        [PSCredential]
+        [Parameter(Mandatory=$false)]
+        $cred
     )
 
     $scriptBlock = {
@@ -130,6 +252,13 @@ function Invoke-RmStopPauseSearch
             [Parameter(Mandatory=$true)]
             $Pause
         )
+
+        $service = Get-Service SPSearchHostController
+
+        if($service.Status -ne 'Stopped')
+        {
+            break
+        } 
 
         Add-PSSnapin Microsoft.SharePoint.PowerShell
 
@@ -185,7 +314,10 @@ function Invoke-RmStartResumeSearch
         $Version,
         [bool]
         [Parameter(Mandatory=$true)]
-        $Pause
+        $Pause,
+        [PSCredential]
+        [Parameter(Mandatory=$false)]
+        $cred
     )
 
     $scriptBlock = {
@@ -201,6 +333,13 @@ function Invoke-RmStartResumeSearch
             [Parameter(Mandatory=$true)]
             $Pause
         )
+
+        $service = Get-Service SPSearchHostController
+
+        if($service.Status -ne 'Stopped')
+        {
+            break
+        } 
 
         Add-PSSnapin Microsoft.SharePoint.PowerShell -EA 0
 
@@ -256,7 +395,12 @@ function Invoke-RmPatch
         $isCacheHost,
         [string]
         [Parameter(Mandatory=$true)]
-        $Patch
+        $Patch,
+        [PSCredential]
+        [Parameter(Mandatory=$false)]
+        $cred,
+        [Parameter(Mandatory=$true)]
+        $AsJob
     )
     $restart = $false
     $scriptBlock = {
@@ -268,7 +412,8 @@ function Invoke-RmPatch
         $p = Start-Process $Patch -ArgumentList '/quiet /norestart' -Wait -PassThru -NoNewWindow
         Write-Host "Completed installing $patch with an ExitCode of $($p.ExitCode)"
         if(!($p.ExitCode -eq 0) -and !($p.ExitCode -eq 3010) -and !($p.ExitCode -eq 17022)){
-            throw [System.Configuration.Install.InstallException] "The patch failed to install. ExitCode: $($p.ExitCode)" 
+            throw [System.Configuration.Install.InstallException] "The patch failed to install. ExitCode: $($p.ExitCode)"
+            Get-OfficeErrorCode $p.ExitCode
         }
 
         if(($p.ExitCode -eq 3010) -or ($p.ExitCode -eq 17022))
@@ -278,8 +423,18 @@ function Invoke-RmPatch
         }
     }
 
+    Write-Host "Beginning patching process on $ServerName..."
     $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
-    $restart = Invoke-Command -Session $session -ScriptBlock $scriptBlock -ArgumentList $Patch
+
+    if($AsJob = $true)
+    {
+        Invoke-Command -Session $session -ScriptBlock $scriptBlock -ArgumentList $Patch  -AsJob
+    }
+    else
+    {
+        Invoke-Command -Session $session -ScriptBlock $scriptBlock -ArgumentList $Patch
+    }
+
     Remove-PSSession $session
 
     if($restart)
@@ -305,20 +460,19 @@ function Invoke-RmConfigWizard
     (
         [string]
         [Parameter(Mandatory=$true)]
-        $ServerName
+        $ServerName,
+        [PSCredential]
+        [Parameter(Mandatory=$false)]
+        $cred
     )
 
-    $scriptBlock = { 
-    param
-    (
-        [string]
-        [Parameter(Mandatory=$true)]
-        $confWizard
-    )
-
-    Add-PSSnapin Microsoft.SharePoint.PowerShell
-    $p = Start-Process 'psconfig.exe' -ArgumentList $confWizard -Wait -PassThru -NoNewWindow
-    Write-Host "ExitCode: $($p.ExitCode)" }
+    $scriptBlock = {
+        $confWizard = '-cmd upgrade -inplace b2b -wait -cmd applicationcontent -install -cmd installfeatures -cmd secureresources'
+        Add-PSSnapin Microsoft.SharePoint.PowerShell
+        Measure-Command {
+            $p = Start-Process 'psconfig.exe' -ArgumentList $confWizard -Wait -PassThru -NoNewWindow
+        }
+        Write-Host "ExitCode: $($p.ExitCode)" }
 
     $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
     Invoke-Command -Session $session -ScriptBlock $scriptBlock -ArgumentList $confWizard
@@ -331,24 +485,67 @@ function Invoke-RmSPContentDatabaseUpgrade
     (
         [string]
         [Parameter(Mandatory=$true)]
-        $ServerName
+        $ServerName,
+        [bool]
+        [Parameter(Mandatory=$true)]
+        $ConcurentPatching,
+        [PSCredential]
+        [Parameter(Mandatory=$false)]
+        $cred
     )
 
     $scriptBlock = {
+        param
+        (
+            [bool]
+            [Parameter(Mandatory=$true)]
+            $ConcurrentPatching
+        )
         Add-PSSnapin Microsoft.SharePoint.PowerShell
         Write-Host 'Beginning Content Database Upgrade.'
-        foreach($db in Get-SPContentDatabase)
+
+        if($ConcurrentPatching -eq $true)
         {
-            Write-Host "Upgrading $($db.Name)..."
-            Upgrade-SPContentDatabase $db -Confirm:$false
-            Write-Host "Completed upgrading $($db.Name)."
+            foreach($db in Get-SPContentDatabase)
+            {
+                $scriptBlockCdb = {
+                    param
+                    (
+                        [string]
+                        [Parameter(Mandatory=$true)]
+                        $databaseName
+                    )
+
+                    Write-Host "Upgrading $databaseName..."
+                    Measure-Command {
+                        Upgrade-SPContentDatabase $databaseName -Confirm:$false
+                    }
+                    Write-Host "Completed upgrading $databaseName."
+                }
+                    Start-Job $ScriptBlock -ArgumentList $db.Name
+            }
+
+            While (Get-Job -State 'Running') { Start-Sleep 10 }
+            Get-Job | Receive-Job
+            Remove-Job *
+        }
+        else
+        {
+            foreach($db in Get-SPContentDatabase)
+            {
+                Write-Host "Upgrading $($db.Name)..."
+                Measure-Command {
+                    Upgrade-SPContentDatabase $databaseName -Confirm:$false
+                }
+                Write-Host "Completed upgrading $($db.Name)."
+            }
         }
 
         Write-Host 'All Content Databases have been upgraded.'
     }
 
     $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
-    Invoke-Command -Session $session -ScriptBlock $scriptBlock
+    Invoke-Command -Session $session -ScriptBlock $scriptBlock -ArgumentList $ConcurentPatching
     Remove-PSSession $session
 }
 
@@ -358,10 +555,13 @@ function Update-RmStopDistributedCache
     (
         [string]
         [Parameter(Mandatory=$true)]
-        $ServerName
+        $ServerName,
+        [PSCredential]
+        [Parameter(Mandatory=$false)]
+        $cred,
+        [Parameter(Mandatory=$true)]
+        $AsJob
     )
-
-    #pulled from TN
 
     $scriptBlock = {
         $startTime = Get-Date
@@ -372,8 +572,8 @@ function Update-RmStopDistributedCache
         try
         {
             Add-PSSnapin Microsoft.SharePoint.PowerShell
+
             Use-CacheCluster
-            #Get-AFCacheClusterHealth
             $computer = [System.Net.Dns]::GetHostByName(($env:computerName)).HostName
             Write-Host "Shutting down Distributed Cache host $computer."
 
@@ -410,8 +610,65 @@ function Update-RmStopDistributedCache
     }
 
     $session = New-PSSession -ComputerName $ServerName -Authentication Credssp -Credential $cred
-    Invoke-Command -Session $session -ScriptBlock $scriptBlock
+
+    if($AsJob = $true)
+    {
+        Invoke-Command -Session $session -ScriptBlock $scriptBlock -AsJob
+    }
+    else
+    {
+        Invoke-Command -Session $session -ScriptBlock $scriptBlock
+    }
+
     Remove-PSSession $session
+}
+
+function Rename-LoadBalancerFile
+{
+    param
+    (
+        [string]
+        [Parameter(Mandatory=$true)]
+        $ServerName,
+        [bool]
+        [Parameter(Mandatory=$true)]
+        $Revert,
+        [string]
+        [Parameter(Mandatory=$true)]
+        $filePath,
+        [PSCredential]
+        [Parameter(Mandatory=$false)]
+        $cred
+    )
+
+    $scriptBlock = {
+        param
+        (
+            [bool]
+            [Parameter(Mandatory=$true)]
+            $Revert,
+            [string]
+            [Parameter(Mandatory=$true)]
+            $filePath
+        )
+
+        if(Test-Path -IsValid $filePath)
+        {
+            if($Revert -eq $true)
+            {
+                $fileName = [IO.Path]::GetFileName($filePath)
+                $directory = [IO.Path]::GetDirectoryName($filePath)
+
+                Rename-Item -Path "$directory\TestFile.txt" -NewName $fileName
+            }
+            else
+            {
+                Rename-Item -Path $filePath -NewName 'TestFile.txt'
+            }
+        }
+    }
+
+    Invoke-Command -ComputerName $ServerName -ScriptBlock $scriptBlock -ArgumentList $Revert, $filePath -Authentication Credssp -Credential $cred
 }
 
 function Update-RmStartDistributedCache
@@ -420,7 +677,10 @@ function Update-RmStartDistributedCache
     (
         [string]
         [Parameter(Mandatory=$true)]
-        $ServerName
+        $ServerName,
+        [PSCredential]
+        [Parameter(Mandatory=$false)]
+        $cred
     )
 
     $scriptBlock = {
@@ -452,73 +712,299 @@ function Start-RmSPUpdate
         [bool]
         [Parameter(Mandatory=$true)]
         $PauseSearch,
+        [string]
         [Parameter(Mandatory=$true)]
         $PatchToApply,
-        [string[]]
+        [string]
+        [Parameter(Mandatory=$true)]
+        $PrimaryHost,
+        [bool]
         [Parameter(Mandatory=$false)]
-        $ServerOrder,
-        [string[]]
+        $ConcurrentPatching,
+        [bool]
         [Parameter(Mandatory=$false)]
-        $DistCacheServers,
-        [string[]]
-        [Parameter(Mandatory=$false)]
-        $FrontEnds,
-        [string[]]
-        [Parameter(Mandatory=$false)]
-        $Applications,
-        [string[]]
-        [Parameter(Mandatory=$false)]
-        $Search,
+        $WaitBetweenHosts,
         [PSCredential]
         [Parameter(Mandatory=$true)]
-        $Cred
+        $Cred,
+        [string]
+        [Parameter(Mandatory=$false)]
+        $lbFileLocation
     )
 
-    $Version = Get-RmFarmVersion
-    $servers = Get-RmFarmServers
-
-    if($Version -eq 16)
+    if(!(Test-Path $PatchToApply))
     {
-        $dcs = $servers | ?{$_.Role -eq 'DistributedCache'} | Select Name
+        Write-Host -ForegroundColor Red 'Unable to access patch path.'
+        break
     }
-    elseif($version -eq 15)
+
+    $Version = Get-RmFarmVersion $PrimaryHost
+    $servers = Get-RmFarmServers $PrimaryHost
+    $distributedCacheHosts = Get-RmDistributedCacheHosts $PrimaryHost
+    $searchServerHosts = Get-RmSearchServerHosts $PrimaryHost
+
+    if($ConcurrentPatching -eq $true)
     {
-        if (!([string]::IsNullOrEmpty($DistCacheServers)))
+        $module = Resolve-Path '.\ARSPPM.psm1'
+
+        foreach($server in $servers.Name)
         {
-            $dcs = $DistCacheServers
+            if(!([string]::IsNullOrEmpty($lbFileLocation)))
+            {
+                $scriptBlock =
+                {
+                    param
+                    (
+                        [string]
+                        [Parameter(Mandatory=$true)]
+                        $ServerName,
+                        [bool]
+                        [Parameter(Mandatory=$true)]
+                        $Revert,
+                        [string]
+                        [Parameter(Mandatory=$true)]
+                        $filePath,
+                        [PSCredential]
+                        [Parameter(Mandatory=$true)]
+                        $cred
+                    )
+
+                    Write-Host "Starting function Rename-LoadBalancerFile on $server."
+                    Rename-LoadBalancerFile -ServerName $ServerName -Revert $Revert -filePath $filePath -cred $Cred
+                }
+
+                Start-Job -Name 'Rename-LoadBalancerFile' -InitializationScript ([scriptblock]::Create("Import-Module $module")) `
+                    -ScriptBlock $scriptBlock -ArgumentList $server,$false,$lbFileLocation,$Cred | Out-Null
+            }
+        }
+
+        Write-Host -NoNewline 'Waiting to complete function Rename-LoadBalancerFile.'
+
+        While (Get-Job -Name 'Rename-LoadBalancerFile' | where { $_.State -eq 'Running' } )
+        {
+            Start-Sleep 1
+            Write-Host -NoNewline '.'
+        }
+        
+        Write-Host
+        Write-Host 'Rename-LoadBalancerFile has completed.'
+        
+        foreach($server in $servers.Name)
+        {
+            if($StopServices -eq $true)
+            {
+                Write-Host "Starting function Stop-RmSPServices on $server."
+
+                    $scriptBlock =
+                    {
+                        param
+                        (
+                            [string]
+                            [Parameter(Mandatory=$true)]
+                            $ServerName,
+                            [PSCredential]
+                            [Parameter(Mandatory=$true)]
+                            $cred
+                        )
+
+                        Write-Host "Starting function Rename-LoadBalancerFile on $server."
+                        Stop-RmSPServices -ServerName $ServerName -cred $cred
+                    }
+
+                    Start-Job -Name 'Stop-RmSPServices' -InitializationScript ([scriptblock]::Create("Import-Module $module")) `
+                        -ScriptBlock $scriptBlock -ArgumentList $server,$Cred | Out-Null
+                }
+            }
+
+        Write-Host -NoNewline 'Waiting to complete function Stop-RmSPServices.'
+
+        While (Get-Job -Name 'Stop-RmSPServices' | where { $_.State -eq 'Running' } )
+        {
+            Start-Sleep 1
+            Write-Host -NoNewline '.'
+        }
+        
+        Write-Host
+        Write-Host 'Stop-RmSPServices has completed.'
+
+
+        foreach($server iN $servers.Name)
+        {   
+            [bool]$isSrs = $false
+            
+            if($searchServerHosts.Contains($server))
+            {
+                $isSrs = $true
+            }
+            else
+            {
+                $isSrs = $false
+            }
+
+            if($isSrs -eq $true)
+            {
+                Invoke-RmStopPauseSearch -ServerName $server -Version $Version -Pause $PauseSearch -cred $cred
+            }
+        }
+
+        Write-Host 'Waiting for Search to pause.'
+        while(Get-Job -State 'Running') { Start-Sleep 10 }
+        Get-Job | Receive-Job
+        Remove-Job *
+
+        foreach($server in $servers.Name)
+        {
+            [bool]$isDcs = $false
+
+
+            if($distributedCacheHosts.Contains($server))
+            {
+                $isDcs = $true
+            }
+            else
+            {
+                $isDsc = $false
+            }
+
+            Invoke-RmPatch -ServerName $server -isCacheHost $isDcs -Patch $PatchToApply -AsJob $true -cred $cred
+        }
+
+        Write-Host 'Waiting for patch installation.'
+        while(Get-Job -State 'Running') { Start-Sleep 10 }
+        Get-Job | Receive-Job
+        Remove-Job *
+
+        foreach($server in $servers.Name)
+        {
+            Start-RmSPServices -ServerName $server -AsJob $true -cred $cred
+        }
+
+        Write-Host 'Waiting for Services to start.'
+        while(Get-Job -State 'Running') { Start-Sleep 10 }
+        Get-Job | Receive-Job
+        Remove-Job *
+
+        foreach($server in $servers.Name)
+        {
+            [bool]$isSrs = $false
+            
+            if($searchServerHosts.Contains($server))
+            {
+                $isSrs = $true
+            }
+            else
+            {
+                $isSrs = $false
+            }
+
+            if($isSrs -eq $true)
+            {
+                Invoke-RmStartResumeSearch -ServerName $server -Version $Version -Pause $PauseSearch -cred $cred
+            }            
+        }
+
+        Write-Host 'Waiting for Search to resume.'
+        while(Get-Job -State 'Running') { Start-Sleep 10 }
+        Get-Job | Receive-Job
+        Remove-Job *
+
+        foreach($server in $server.Name)
+        {
+            if(!([string]::IsNullOrEmpty($lbFileLocation)))
+            {
+                Rename-LoadBalancerFile -ServerName $server -Revert $true -filePath $lbFileLocation -AsJob $true -cred $cred
+            }
+        }
+
+        Write-Host 'Waiting for LB file to revert name.'
+        while(Get-Job -State 'Running') { Start-Sleep 10 }
+        Get-Job | Receive-Job
+        Remove-Job *
+
+    }
+    else
+    {    
+        foreach($server in $servers.Name)
+        {
+            Write-Host "Starting process on $server..."
+            Measure-Command {
+                [bool]$isDcs = $false
+                [bool]$isSrs = $false
+
+                if($distributedCacheHosts.Contains($server))
+                {
+                    $isDcs = $true
+                }
+                else
+                {
+                    $isDsc = $false
+                }
+
+                if($searchServerHosts.Contains($server))
+                {
+                    $isSrs = $true
+                }
+                else
+                {
+                    $isSrs = $false
+                }
+
+                if(!([string]::IsNullOrEmpty($lbFileLocation)))
+                {
+                    Rename-LoadBalancerFile $ServerName $false $lbFileLocation
+                }
+
+                Stop-RmSPServices $server
+
+                if($isSrs -eq $true)
+                {
+                    Invoke-RmStopPauseSearch $server $version $PauseSearch
+                }
+
+                Invoke-RmPatch $server $isSrs $PatchToApply
+                Start-RmSPServices $server
+
+                if($isSrs -eq $true)
+                {
+                    Invoke-RmStartResumeSearch $server $version $PauseSearch
+                }
+
+                if(!([string]::IsNullOrEmpty($lbFileLocation)))
+                {
+                    Rename-LoadBalancerFile $ServerName $true $lbFileLocation
+                }
+
+                $isDcs = $false
+                $isSrs = $false
+
+                if($WaitBetweenHosts -eq $true)
+                {
+                    Read-Host "Completed patching $server. Press Enter to continue or Ctrl-C to stop execution."
+                }
+            }
         }
     }
 
+    Invoke-RmSPContentDatabaseUpgrade $PrimaryHost $ConcurrentPatching
+
     foreach($server in $servers)
     {
-        [bool]$isDcs
 
-        if($dcs -eq $server)
+        if(!([string]::IsNullOrEmpty($lbFileLocation)))
         {
-            $isDcs = $true
+            Rename-LoadBalancerFile $ServerName $true $lbFileLocation
         }
 
-        Stop-RmSPServices $server
-        Invoke-RmStopPauseSearch $server $version $PauseSearch
-        Invoke-RmPatch $server $isDcs $PatchToApply
-        Start-RmSPServices $server
-        Invoke-RmStartResumeSearch $server $version $PauseSearch
-
-        $isDcs = $false         
-    }
-
-    Invoke-RmSPContentDatabaseUpgrade $server[0]
-
-    foreach($server in $servers)
-    {
         Invoke-RmConfigWizard $server
-    }
-}
 
-function Invoke-SharePointWinRmConfig
-{
-    Enable-PSRemoting -Force
-    Enable-WSManCredSSP –Role Server -Force
-    winrm set winrm/config/winrs '@{MaxShellsPerUser="25"}'
-    winrm set winrm/config/winrs '@{MaxMemoryPerShellMB="1024"}'
+        if(!([string]::IsNullOrEmpty($lbFileLocation)))
+        {
+            Rename-LoadBalancerFile $ServerName $true $lbFileLocation
+        }
+
+        if($WaitBetweenHosts -eq $true)
+        {
+            Read-Host "Completed running psconfig on $server. Press Enter to continue or Ctrl-C to stop execution."
+        }  
+    }
 }
