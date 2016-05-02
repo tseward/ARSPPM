@@ -245,12 +245,13 @@ function Invoke-RmStopPauseSearch
             $Pause
         )
 
-<#        $service = Get-Service SPSearchHostController
+        $service = Get-Service SPSearchHostController
+        $service2 = Get-Service OSearch15
 
-        if($service.Status -ne 'Stopped')
+        if(($service.Status -eq 'Stopped') -or ($service2.Status -eq 'Stopped'))
         {
             break
-        } #>
+        }
 
         Add-PSSnapin Microsoft.SharePoint.PowerShell
 
@@ -258,6 +259,11 @@ function Invoke-RmStopPauseSearch
         {
             if($Pause)
             {
+                #Check if paused first
+                if ($ssa.IsPaused() -eq 128)
+                {
+                    break
+                }
                 Write-Host "Pausing $($ssa.Name)"
                 $ssa.Pause()
 
@@ -327,27 +333,45 @@ function Invoke-RmStartResumeSearch
         )
 
 <#        $service = Get-Service SPSearchHostController
+        $service2 = Get-Service OSearch15
 
-        if($service.Status -ne 'Stopped')
+        if(($service.Status -ne 'Stopped') -or ($service2.Status -ne 'Stopped'))
         {
             break
-        } #>
+        }#>
 
         Add-PSSnapin Microsoft.SharePoint.PowerShell -EA 0
 
         Write-Host "Starting OSearch$Version"
         switch ($Version)
         {
-            14 {Set-Service -Name OSearch14 -StartupType Manual; Start-Service OSearch14 }
-            15 {Set-Service -Name OSearch15 -StartupType Manual; Start-Service OSearch15 }
-            16 {Set-Service -Name OSearch16 -StartupType Manual; Start-Service OSearch16 }
+            14 {Set-Service -Name OSearch14 -StartupType Manual; Start-Service OSearch14;
+                    $service = Get-Service OSearch14
+                    while($service.Status -ne 'Running')
+                    {Sleep 1}}
+            15 {Set-Service -Name OSearch15 -StartupType Manual; Start-Service OSearch15;
+                    $service = Get-Service OSearch15
+                    while($service.Status -ne 'Running')
+                    {Sleep 1}}
+            16 {Set-Service -Name OSearch16 -StartupType Manual; Start-Service OSearch16                     
+                    $service = Get-Service OSearch16
+                    while($service.Status -ne 'Running')
+                    {Sleep 1}}
         }
+
+
 
         if($Version -eq 15 -or $Version -eq 16)
         {
             Write-Host 'Enabling SPSearchHostController'
             Set-Service -Name SPSearchHostController -StartupType Automatic
             Start-Service SPSearchHostController
+            $sevice = Get-Service SPSearchHostController
+
+            while($service.Status -ne 'Running')
+            {
+                Sleep 1
+            }
         }
 
         foreach($ssa in Get-SPEnterpriseSearchServiceApplication)
@@ -459,7 +483,7 @@ function Invoke-RmConfigWizard
         Write-Host "ExitCode: $($p.ExitCode)"
         }
 
-    Invoke-Command -ComputerName $ServerName -ScriptBlock $scriptBlock -ArgumentList $confWizard -Authentication Credssp -Credential $cred
+    Invoke-Command -ComputerName $ServerName -ScriptBlock $scriptBlock -Authentication Credssp -Credential $cred
 }
 
 function Invoke-RmSPContentDatabaseUpgrade
@@ -642,6 +666,7 @@ function Rename-LoadBalancerFile
             {
                 Rename-Item -Path $filePath -NewName 'TestFile.txt'
             }
+            Sleep 10
         }
         else
         {
@@ -777,16 +802,19 @@ function Start-RmSPUpdate
             }
         }
 
-        Write-Host -NoNewline 'Waiting to complete function Rename-LoadBalancerFile.'
-
-        While (Get-Job -Name 'Rename-LoadBalancerFile' | where { $_.State -eq 'Running' } )
+        if (!([string]::IsNullOrEmpty($lbFileLocation)))
         {
-            Start-Sleep 1
-            Write-Host -NoNewline '.'
-        }
+            Write-Host -NoNewline 'Waiting to complete function Rename-LoadBalancerFile.'
+
+            While (Get-Job -Name 'Rename-LoadBalancerFile' | where { $_.State -eq 'Running' } )
+            {
+                Start-Sleep 1
+                Write-Host -NoNewline '.'
+            }
         
-        Write-Host
-        Write-Host 'Rename-LoadBalancerFile has completed.'
+            Write-Host
+            Write-Host 'Rename-LoadBalancerFile has completed.'
+        }
 #endregion
 
 #region Invoke-RmStopPauseSearch
@@ -1024,8 +1052,7 @@ function Start-RmSPUpdate
         
         Write-Host
         Write-Host 'Invoke-RmStartResumeSearch has completed.'
-        break
-
+        
 #endregion
 
 #region Rename-LoadBalancerFile
@@ -1060,16 +1087,19 @@ function Start-RmSPUpdate
             }
         }
 
-        Write-Host -NoNewline 'Waiting to complete function Rename-LoadBalancerFile.'
-
-        While (Get-Job -Name 'Rename-LoadBalancerFile' | where { $_.State -eq 'Running' } )
+        if (!([string]::IsNullOrEmpty($lbFileLocation)))
         {
-            Start-Sleep 1
-            Write-Host -NoNewline '.'
-        }
+            Write-Host -NoNewline 'Waiting to complete function Rename-LoadBalancerFile.'
+
+            While (Get-Job -Name 'Rename-LoadBalancerFile' | where { $_.State -eq 'Running' } )
+            {
+                Start-Sleep 1
+                Write-Host -NoNewline '.'
+            }
         
-        Write-Host
-        Write-Host 'Rename-LoadBalancerFile has completed.'
+            Write-Host
+            Write-Host 'Rename-LoadBalancerFile has completed.'
+        }
 #endregion
 
     }
@@ -1080,17 +1110,17 @@ function Start-RmSPUpdate
         {
             Write-Host "Starting process on $server..."
             Measure-Command {
-                [bool]$isDcs = $false
-                [bool]$isSrs = $false
+                [bool]$isDcs1 = $false
+                [bool]$isSrs1 = $false
 
                 if($distributedCacheHosts.Contains($server))
                 {
-                    $isDcs = $true
+                    $isDcs1 = $true
                 }
 
                 if($searchServerHosts.Contains($server))
                 {
-                    $isSrs = $true
+                    $isSrs1 = $true
                 }
 
                 if(!([string]::IsNullOrEmpty($lbFileLocation)))
@@ -1098,17 +1128,17 @@ function Start-RmSPUpdate
                     Rename-LoadBalancerFile $ServerName $false $lbFileLocation $Cred
                 }
 
-                Stop-RmSPServices $server
+                Stop-RmSPServices $server $Cred
 
-                if($isSrs -eq $true)
+                if($isSrs1 -eq $true)
                 {
                     Invoke-RmStopPauseSearch $server $version $PauseSearch $Cred
                 }
 
-                Invoke-RmPatch $server $isDcs $PatchToApply $Cred
+                Invoke-RmPatch $server $isDcs1 $PatchToApply $Cred
                 Start-RmSPServices $server $Cred
 
-                if($isSrs -eq $true)
+                if($isSrs1 -eq $true)
                 {
                     Invoke-RmStartResumeSearch $server $version $PauseSearch $Cred
                 }
@@ -1118,8 +1148,8 @@ function Start-RmSPUpdate
                     Rename-LoadBalancerFile $ServerName $true $lbFileLocation $cred
                 }
 
-                $isDcs = $false
-                $isSrs = $false
+                $isDcs1 = $false
+                $isSrs1 = $false
 
                 if($WaitBetweenHosts -eq $true)
                 {
@@ -1130,22 +1160,24 @@ function Start-RmSPUpdate
 #endregion
     }
 
-    Invoke-RmSPContentDatabaseUpgrade $PrimaryHost $ConcurrentPatching
+    Write-Host 'Upgrading Content Databases...'
+    Invoke-RmSPContentDatabaseUpgrade $PrimaryHost $ConcurrentPatching $Cred
 
 #region Invoke-RmConfigWizard
-    foreach($server in $servers)
+    foreach($server in $servers.Name)
     {
 
         if(!([string]::IsNullOrEmpty($lbFileLocation)))
         {
-            Rename-LoadBalancerFile $ServerName $true $lbFileLocation $Cred
+            Rename-LoadBalancerFile $server $true $lbFileLocation $Cred
         }
 
-        Invoke-RmConfigWizard $server
-
+        Write-Host 'Running Config Wizard...'
+        Invoke-RmConfigWizard $server $Cred
+        #validate result is 0 before moving to the next host
         if(!([string]::IsNullOrEmpty($lbFileLocation)))
         {
-            Rename-LoadBalancerFile $ServerName $true $lbFileLocation $Cred
+            Rename-LoadBalancerFile $server $true $lbFileLocation $Cred
         }
 
         if($WaitBetweenHosts -eq $true)
