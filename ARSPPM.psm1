@@ -551,7 +551,7 @@ function Invoke-RmSPContentDatabaseUpgrade
             {
                 Write-Host "Upgrading $($db.Name)..."
                 Measure-Command {
-                    Upgrade-SPContentDatabase $databaseName -Confirm:$false
+                    Upgrade-SPContentDatabase $db -Confirm:$false
                 }
                 Write-Host "Completed upgrading $($db.Name)."
             }
