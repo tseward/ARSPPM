@@ -7,6 +7,7 @@ Exmaple usage:
 
     Import-Module .\ARSPPM.psm1
     $cred = Get-Credential #must be a Local/Farm Admin on SharePoint
-    $ph = SP01 #This is the host where farm detection takes place, as well as where Content Databases are upgraded
+    $ph = SP01 #This is the host where farm detection takes place and where Content Databases are upgraded
     $patch = "\\fileserver\patches\ubersrvprj2013-kb3114493-fullfile-x64-glb.exe" #UNC to the patch
-    Start-RmSPUpdate -StopServices $true -PauseSearch $true -PrimaryHost $ph -ConcurrentPatching $false -Cred $cred -PatchToApply $patch
+    Start-RmSPUpdate -StopServices $true -PauseSearch $true -PrimaryHost $ph `
+        -ConcurrentPatching $false -Cred $cred -PatchToApply $patch
