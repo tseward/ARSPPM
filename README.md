@@ -11,3 +11,5 @@ Exmaple usage:
     $patch = "\\fileserver\patches\ubersrvprj2013-kb3114493-fullfile-x64-glb.exe" #UNC to the patch
     Start-RmSPUpdate -StopServices $true -PauseSearch $true -PrimaryHost $ph `
         -ConcurrentPatching $false -Cred $cred -PatchToApply $patch
+
+A process flow diagram is available from the [Wiki](https://github.com/Nauplius/ARSPPM/wiki/Process-Diagram).
