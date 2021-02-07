@@ -1,7 +1,3 @@
-**Repository Moved**
-
-This repository has moved to [tseward/ARSPPM](https://github.com/tseward/ARSPPM).
-
 # ARSPPM
 Automated Remote SharePoint Patch Management
 
